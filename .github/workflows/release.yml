@@ -1,0 +1,400 @@
+name: Build and Release
+
+# 源码在私有仓库 HaiTang-8/video-player-client，本仓库只负责构建与发布。
+# 需要 secret：SOURCE_TOKEN（能读取私有源码仓库的 PAT）、SPARKLE_PRIVATE_KEY
+
+on:
+  repository_dispatch:
+    types: [publish]
+  # 手动触发：create_release 关闭时只构建四个平台，不发布 Release，用于验证流水线
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "私有源码仓库的 ref（tag / 分支 / SHA）"
+        required: true
+        type: string
+        default: "main"
+      tag_name:
+        description: "Release tag（ref 以 v 开头时可留空）"
+        required: false
+        type: string
+        default: ""
+      create_release:
+        description: "构建后创建或更新 Release"
+        type: boolean
+        default: false
+
+env:
+  SOURCE_REPO: HaiTang-8/video-player-client
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.meta.outputs.ref }}
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      create_release: ${{ steps.meta.outputs.create_release }}
+    steps:
+      - name: Resolve source ref
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          IN_REF: ${{ github.event.client_payload.ref || inputs.ref }}
+          IN_TAG: ${{ github.event.client_payload.tag_name || inputs.tag_name }}
+          IN_RELEASE: ${{ github.event.client_payload.create_release || inputs.create_release }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "SOURCE_TOKEN 未配置（需要对 $SOURCE_REPO 有读权限）" >&2
+            exit 1
+          fi
+          ref="$IN_REF"
+          tag="$IN_TAG"
+          cr="$IN_RELEASE"
+          if [[ -z "$ref" ]]; then echo "ref is required" >&2; exit 1; fi
+          if [[ -z "$tag" && "$ref" == v* ]]; then tag="$ref"; fi
+          if [[ -z "$cr" ]]; then cr=true; fi
+          if [[ "$cr" == true && -z "$tag" ]]; then
+            echo "发布 Release 需要 tag_name" >&2
+            exit 1
+          fi
+          gh api "repos/$SOURCE_REPO/commits/$ref" --jq .sha > /dev/null
+          if [[ -n "$tag" ]]; then
+            version="${tag#v}"
+          else
+            version="$(gh api -H 'Accept: application/vnd.github.raw' "repos/$SOURCE_REPO/contents/pubspec.yaml?ref=$ref" | sed -n 's/^version: *\([^+]*\).*/\1/p')"
+          fi
+          {
+            echo "ref=$ref"
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "create_release=$cr"
+          } >> "$GITHUB_OUTPUT"
+
+  build-windows:
+    needs: resolve
+    runs-on: windows-2022
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version-file: src/.fvmrc
+          channel: 'stable'
+      - name: Diagnose Windows toolchain
+        shell: pwsh
+        run: |
+          flutter doctor -v
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+      # lockfile 在本地用镜像 pub.flutter-io.cn 生成；换回 pub.dev 后才会严格按 lockfile 安装（包内容和 sha256 一致）
+      - name: Use pub.dev in lockfile
+        shell: bash
+        run: sed -i.bak 's#https://pub.flutter-io.cn#https://pub.dev#g' pubspec.lock && rm pubspec.lock.bak
+      - run: flutter pub get --enforce-lockfile
+      - run: flutter build windows --release --build-name=${{ needs.resolve.outputs.version }}
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+      - name: Download Chinese language file for Inno Setup
+        run: Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl" -OutFile "C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl"
+      - name: Build EXE Installer
+        shell: pwsh
+        run: |
+          $version = "${{ needs.resolve.outputs.version }}"
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=$version windows\inno_setup.iss
+      - name: Rename installer
+        shell: pwsh
+        run: |
+          Move-Item -Path "dist\guanying-windows-setup.exe" -Destination "guanying-windows-${{ needs.resolve.outputs.version }}-setup.exe"
+      - name: Create ZIP (backup)
+        run: Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath guanying-windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: |
+            src/guanying-windows-${{ needs.resolve.outputs.version }}-setup.exe
+            src/guanying-windows.zip
+
+  build-macos:
+    needs: resolve
+    runs-on: macos-26
+    defaults:
+      run:
+        working-directory: src
+    env:
+      # AetherEngine 7.54.0 需要 Xcode 26.2+，目前只验证过 26.3（镜像默认是 26.6）
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+      - run: xcodebuild -version
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version-file: src/.fvmrc
+          channel: 'stable'
+      # lockfile 在本地用镜像 pub.flutter-io.cn 生成；换回 pub.dev 后才会严格按 lockfile 安装（包内容和 sha256 一致）
+      - name: Use pub.dev in lockfile
+        shell: bash
+        run: sed -i.bak 's#https://pub.flutter-io.cn#https://pub.dev#g' pubspec.lock && rm pubspec.lock.bak
+      - run: flutter pub get --enforce-lockfile
+      - run: flutter build macos --release --build-name=${{ needs.resolve.outputs.version }}
+      - name: Create DMG
+        run: |
+          brew install create-dmg
+          create-dmg \
+            --volname "观影" \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "观影.app" 150 200 \
+            --app-drop-link 450 200 \
+            --no-internet-enable \
+            "guanying-macos-${{ needs.resolve.outputs.version }}.dmg" \
+            "build/macos/Build/Products/Release/观影.app"
+      - name: Sign DMG with Sparkle EdDSA
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          echo "$SPARKLE_PRIVATE_KEY" | macos/Pods/Sparkle/bin/sign_update "guanying-macos-${{ needs.resolve.outputs.version }}.dmg" -f - > sparkle_signature.txt
+          cat sparkle_signature.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-build
+          path: |
+            src/guanying-macos-${{ needs.resolve.outputs.version }}.dmg
+            src/sparkle_signature.txt
+
+  build-android:
+    needs: resolve
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK components
+        run: |
+          for attempt in 1 2 3; do
+            if yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;27.0.12077973" "cmake;3.22.1"; then
+              exit 0
+            fi
+            rm -rf "$ANDROID_HOME/ndk/27.0.12077973"
+            sleep 10
+          done
+          exit 1
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version-file: src/.fvmrc
+          channel: 'stable'
+          cache: true
+
+      - name: Cache pub dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            .dart_tool
+          key: pub-${{ runner.os }}-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      - name: Cache media-kit native libraries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches/modules-2/files-2.1/com.github.nickoehler
+            android/.gradle
+          key: media-kit-android-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            media-kit-android-
+
+      # lockfile 在本地用镜像 pub.flutter-io.cn 生成；换回 pub.dev 后才会严格按 lockfile 安装（包内容和 sha256 一致）
+      - name: Use pub.dev in lockfile
+        shell: bash
+        run: sed -i.bak 's#https://pub.flutter-io.cn#https://pub.dev#g' pubspec.lock && rm pubspec.lock.bak
+      - run: flutter pub get --enforce-lockfile
+
+      - run: flutter build apk --release --split-per-abi --target-platform android-arm,android-arm64 --build-name=${{ needs.resolve.outputs.version }}
+
+      - name: Rename artifacts
+        run: |
+          mv build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk guanying-android-armeabi-v7a.apk
+          mv build/app/outputs/flutter-apk/app-arm64-v8a-release.apk guanying-android-arm64-v8a.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-build
+          path: |
+            src/guanying-android-armeabi-v7a.apk
+            src/guanying-android-arm64-v8a.apk
+
+  build-ios:
+    needs: resolve
+    runs-on: macos-26
+    defaults:
+      run:
+        working-directory: src
+    env:
+      # AetherEngine 7.54.0 需要 Xcode 26.2+，目前只验证过 26.3（镜像默认是 26.6）
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+      - run: xcodebuild -version
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version-file: src/.fvmrc
+          channel: 'stable'
+      # lockfile 在本地用镜像 pub.flutter-io.cn 生成；换回 pub.dev 后才会严格按 lockfile 安装（包内容和 sha256 一致）
+      - name: Use pub.dev in lockfile
+        shell: bash
+        run: sed -i.bak 's#https://pub.flutter-io.cn#https://pub.dev#g' pubspec.lock && rm pubspec.lock.bak
+      - run: flutter pub get --enforce-lockfile
+      - run: flutter build ios --release --no-codesign --build-name=${{ needs.resolve.outputs.version }}
+      - name: Create IPA
+        run: |
+          mkdir -p Payload
+          cp -r build/ios/iphoneos/Runner.app Payload/
+          zip -r media_player-ios.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-build
+          path: src/media_player-ios.ipa
+
+  release:
+    needs: [resolve, build-windows, build-macos, build-android, build-ios]
+    if: needs.resolve.outputs.create_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Build Changelog
+        id: build_changelog
+        uses: mikepenz/release-changelog-builder-action@v4
+        with:
+          configuration: "src/.github/release-changelog-builder-config.json"
+          commitMode: true
+          path: src
+          owner: HaiTang-8
+          repo: video-player-client
+          toTag: ${{ needs.resolve.outputs.tag }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+      - name: Generate appcast.xml
+        run: |
+          VERSION="${{ needs.resolve.outputs.version }}"
+          REPO="${{ github.repository }}"
+
+          # Windows EXE info
+          EXE_URL="https://github.com/${REPO}/releases/download/v${VERSION}/guanying-windows-${VERSION}-setup.exe"
+          EXE_SIZE=$(stat -c%s "artifacts/guanying-windows-${VERSION}-setup.exe" 2>/dev/null || echo "0")
+
+          # macOS DMG info
+          DMG_URL="https://github.com/${REPO}/releases/download/v${VERSION}/guanying-macos-${VERSION}.dmg"
+          DMG_SIZE=$(stat -c%s "artifacts/guanying-macos-${VERSION}.dmg" 2>/dev/null || echo "0")
+
+          # Parse Sparkle EdDSA signature
+          SPARKLE_SIG=$(cat artifacts/sparkle_signature.txt | grep -o 'sparkle:edSignature="[^"]*"' | sed 's/sparkle:edSignature="//;s/"//')
+          DMG_LENGTH=$(cat artifacts/sparkle_signature.txt | grep -o 'length="[^"]*"' | sed 's/length="//;s/"//')
+          if [ -n "$DMG_LENGTH" ]; then
+            DMG_SIZE="$DMG_LENGTH"
+          fi
+
+          cat > artifacts/appcast.xml << EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+            <channel>
+              <title>观影</title>
+              <description>观影应用更新</description>
+              <language>zh-CN</language>
+              <item>
+                <title>版本 ${VERSION}</title>
+                <sparkle:version>${VERSION}</sparkle:version>
+                <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
+                <pubDate>$(date -R)</pubDate>
+                <enclosure
+                  url="${DMG_URL}"
+                  sparkle:version="${VERSION}"
+                  sparkle:shortVersionString="${VERSION}"
+                  sparkle:edSignature="${SPARKLE_SIG}"
+                  length="${DMG_SIZE}"
+                  type="application/x-apple-diskimage"
+                  sparkle:os="macos"/>
+              </item>
+              <item>
+                <title>版本 ${VERSION}</title>
+                <sparkle:version>${VERSION}</sparkle:version>
+                <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
+                <pubDate>$(date -R)</pubDate>
+                <enclosure
+                  url="${EXE_URL}"
+                  sparkle:version="${VERSION}"
+                  sparkle:os="windows"
+                  length="${EXE_SIZE}"
+                  type="application/octet-stream"/>
+              </item>
+            </channel>
+          </rss>
+          EOF
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          for file in *.exe *.dmg *.apk *.ipa *.zip; do
+            if [ -f "$file" ]; then
+              sha256sum "$file" | awk '{print $1}' > "${file}.sha256"
+            fi
+          done
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          files: artifacts/*
+          body: ${{ steps.build_changelog.outputs.changelog }}
