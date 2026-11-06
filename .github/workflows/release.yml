@@ -321,14 +321,13 @@ jobs:
         id: build_changelog
         uses: mikepenz/release-changelog-builder-action@v4
         with:
-          configuration: "src/.github/release-changelog-builder-config.json"
+          configuration: ".github/release-changelog-builder-config.json"
           commitMode: true
           path: src
           owner: HaiTang-8
           repo: video-player-client
           toTag: ${{ needs.resolve.outputs.tag }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          token: ${{ secrets.SOURCE_TOKEN }}
       - name: Generate appcast.xml
         run: |
           VERSION="${{ needs.resolve.outputs.version }}"
