@@ -280,8 +280,9 @@ jobs:
           fi
           apksigner="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner"
           for apk in guanying-android-*.apk; do
-            actual=$("$apksigner" verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
-            echo "$apk $actual"
+            out=$("$apksigner" verify --print-certs "$apk" 2>&1)
+            echo "$out"
+            actual=$(printf '%s\n' "$out" | grep -m1 -i 'certificate SHA-256 digest' | sed 's/.*: *//' | tr -d '[:space:]' || true)
             if [ "$actual" != "$EXPECTED" ]; then
               echo "::error::$apk is signed by $actual, expected $EXPECTED"
               exit 1
