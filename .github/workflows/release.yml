@@ -246,12 +246,47 @@ jobs:
         run: sed -i.bak 's#https://pub.flutter-io.cn#https://pub.dev#g' pubspec.lock && rm pubspec.lock.bak
       - run: flutter pub get --enforce-lockfile
 
+      # 固定签名：每次用 runner 临时生成的 debug 密钥会让各版本签名不同，用户无法覆盖升级
+      - name: Write Android signing config
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ]; then
+            echo "::error::Android signing secrets are missing"
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > android/release.jks
+          printf 'storeFile=release.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEYSTORE_PASSWORD" > android/key.properties
+
       - run: flutter build apk --release --split-per-abi --target-platform android-arm,android-arm64 --build-name=${{ needs.resolve.outputs.version }}
 
       - name: Rename artifacts
         run: |
           mv build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk guanying-android-armeabi-v7a.apk
           mv build/app/outputs/flutter-apk/app-arm64-v8a-release.apk guanying-android-arm64-v8a.apk
+
+      - name: Verify APK signer
+        shell: bash
+        env:
+          EXPECTED: ${{ vars.ANDROID_CERT_SHA256 }}
+        run: |
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::repository variable ANDROID_CERT_SHA256 is not set"
+            exit 1
+          fi
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner"
+          for apk in guanying-android-*.apk; do
+            actual=$("$apksigner" verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+            echo "$apk $actual"
+            if [ "$actual" != "$EXPECTED" ]; then
+              echo "::error::$apk is signed by $actual, expected $EXPECTED"
+              exit 1
+            fi
+          done
 
       - uses: actions/upload-artifact@v4
         with:
