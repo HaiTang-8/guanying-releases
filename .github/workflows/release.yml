@@ -1,7 +1,8 @@
 name: Build and Release
 
 # 源码在私有仓库 HaiTang-8/video-player-client，本仓库只负责构建与发布。
-# 需要 secret：SOURCE_TOKEN（能读取私有源码仓库的 PAT）、SPARKLE_PRIVATE_KEY
+# 需要 secret：SOURCE_TOKEN（只读私有源码仓库的 PAT）、SPARKLE_PRIVATE_KEY、
+# SYMBOLS_S3_ENDPOINT / SYMBOLS_S3_REGION / SYMBOLS_S3_BUCKET / SYMBOLS_ACCESS_KEY_ID / SYMBOLS_SECRET_ACCESS_KEY（仅写私有符号存储）
 
 on:
   repository_dispatch:
@@ -72,6 +73,21 @@ jobs:
             echo "version=$version"
             echo "create_release=$cr"
           } >> "$GITHUB_OUTPUT"
+      - name: Verify symbols storage secrets
+        env:
+          SYMBOLS_S3_ENDPOINT: ${{ secrets.SYMBOLS_S3_ENDPOINT }}
+          SYMBOLS_S3_REGION: ${{ secrets.SYMBOLS_S3_REGION }}
+          SYMBOLS_S3_BUCKET: ${{ secrets.SYMBOLS_S3_BUCKET }}
+          SYMBOLS_ACCESS_KEY_ID: ${{ secrets.SYMBOLS_ACCESS_KEY_ID }}
+          SYMBOLS_SECRET_ACCESS_KEY: ${{ secrets.SYMBOLS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          for name in SYMBOLS_S3_ENDPOINT SYMBOLS_S3_REGION SYMBOLS_S3_BUCKET SYMBOLS_ACCESS_KEY_ID SYMBOLS_SECRET_ACCESS_KEY; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::$name secret is missing"
+              exit 1
+            fi
+          done
 
   build-windows:
     needs: resolve
@@ -102,7 +118,40 @@ jobs:
         shell: bash
         run: sed -i.bak 's#https://pub.flutter-io.cn#https://pub.dev#g' pubspec.lock && rm pubspec.lock.bak
       - run: flutter pub get --enforce-lockfile
-      - run: flutter build windows --release --build-name=${{ needs.resolve.outputs.version }}
+      - run: flutter build windows --release --build-name=${{ needs.resolve.outputs.version }} --obfuscate --split-debug-info=build/symbols/windows
+      - name: Upload Windows symbols
+        shell: bash
+        env:
+          PLATFORM: windows
+          VERSION: ${{ needs.resolve.outputs.version }}
+          CREATE_RELEASE: ${{ needs.resolve.outputs.create_release }}
+          RUN_ID: ${{ github.run_id }}
+          SYMBOLS_S3_ENDPOINT: ${{ secrets.SYMBOLS_S3_ENDPOINT }}
+          SYMBOLS_S3_BUCKET: ${{ secrets.SYMBOLS_S3_BUCKET }}
+          AWS_DEFAULT_REGION: ${{ secrets.SYMBOLS_S3_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.SYMBOLS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SYMBOLS_SECRET_ACCESS_KEY }}
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          AWS_EC2_METADATA_DISABLED: "true"
+        run: |
+          set -euo pipefail
+          command -v aws >/dev/null 2>&1 || export PATH="$PATH:/c/Program Files/Amazon/AWSCLIV2"
+          sym_dir="build/symbols/$PLATFORM"
+          archive="../symbols-${PLATFORM}-${VERSION}.tgz"
+          trap 'rm -rf "$sym_dir" "$archive"' EXIT
+          compgen -G "$sym_dir/*.symbols" >/dev/null || { echo "::error::No .symbols files in $sym_dir"; exit 1; }
+          ls -lh "$sym_dir"
+          tar czf "$archive" -C "$sym_dir" .
+          if [[ "$CREATE_RELEASE" == "true" ]]; then
+            key="symbols/v${VERSION}/symbols-${PLATFORM}-${VERSION}.tgz"
+          else
+            key="symbols/dry-run/${RUN_ID}/symbols-${PLATFORM}-${VERSION}.tgz"
+          fi
+          endpoint="${SYMBOLS_S3_ENDPOINT%/}"
+          [[ "$endpoint" == http*://* ]] || endpoint="https://$endpoint"
+          aws s3api put-object --endpoint-url "$endpoint" --bucket "$SYMBOLS_S3_BUCKET" --key "$key" --body "$archive" --content-type "application/gzip" >/dev/null
+          echo "Uploaded $key ($(wc -c < "$archive" | tr -d ' ') bytes)"
       - name: Install Inno Setup
         run: choco install innosetup -y
       - name: Download Chinese language file for Inno Setup
@@ -152,7 +201,39 @@ jobs:
         shell: bash
         run: sed -i.bak 's#https://pub.flutter-io.cn#https://pub.dev#g' pubspec.lock && rm pubspec.lock.bak
       - run: flutter pub get --enforce-lockfile
-      - run: flutter build macos --release --build-name=${{ needs.resolve.outputs.version }}
+      - run: flutter build macos --release --build-name=${{ needs.resolve.outputs.version }} --obfuscate --split-debug-info=build/symbols/macos
+      - name: Upload macOS symbols
+        shell: bash
+        env:
+          PLATFORM: macos
+          VERSION: ${{ needs.resolve.outputs.version }}
+          CREATE_RELEASE: ${{ needs.resolve.outputs.create_release }}
+          RUN_ID: ${{ github.run_id }}
+          SYMBOLS_S3_ENDPOINT: ${{ secrets.SYMBOLS_S3_ENDPOINT }}
+          SYMBOLS_S3_BUCKET: ${{ secrets.SYMBOLS_S3_BUCKET }}
+          AWS_DEFAULT_REGION: ${{ secrets.SYMBOLS_S3_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.SYMBOLS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SYMBOLS_SECRET_ACCESS_KEY }}
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          AWS_EC2_METADATA_DISABLED: "true"
+        run: |
+          set -euo pipefail
+          sym_dir="build/symbols/$PLATFORM"
+          archive="../symbols-${PLATFORM}-${VERSION}.tgz"
+          trap 'rm -rf "$sym_dir" "$archive"' EXIT
+          compgen -G "$sym_dir/*.symbols" >/dev/null || { echo "::error::No .symbols files in $sym_dir"; exit 1; }
+          ls -lh "$sym_dir"
+          tar czf "$archive" -C "$sym_dir" .
+          if [[ "$CREATE_RELEASE" == "true" ]]; then
+            key="symbols/v${VERSION}/symbols-${PLATFORM}-${VERSION}.tgz"
+          else
+            key="symbols/dry-run/${RUN_ID}/symbols-${PLATFORM}-${VERSION}.tgz"
+          fi
+          endpoint="${SYMBOLS_S3_ENDPOINT%/}"
+          [[ "$endpoint" == http*://* ]] || endpoint="https://$endpoint"
+          aws s3api put-object --endpoint-url "$endpoint" --bucket "$SYMBOLS_S3_BUCKET" --key "$key" --body "$archive" --content-type "application/gzip" >/dev/null
+          echo "Uploaded $key ($(wc -c < "$archive" | tr -d ' ') bytes)"
       - name: Create DMG
         run: |
           brew install create-dmg
@@ -262,7 +343,45 @@ jobs:
           printf 'storeFile=release.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
             "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEYSTORE_PASSWORD" > android/key.properties
 
-      - run: flutter build apk --release --split-per-abi --target-platform android-arm,android-arm64 --build-name=${{ needs.resolve.outputs.version }}
+      - run: flutter build apk --release --split-per-abi --target-platform android-arm,android-arm64 --build-name=${{ needs.resolve.outputs.version }} --obfuscate --split-debug-info=build/symbols/android
+
+      - name: Upload Android symbols
+        shell: bash
+        env:
+          PLATFORM: android
+          VERSION: ${{ needs.resolve.outputs.version }}
+          CREATE_RELEASE: ${{ needs.resolve.outputs.create_release }}
+          RUN_ID: ${{ github.run_id }}
+          SYMBOLS_S3_ENDPOINT: ${{ secrets.SYMBOLS_S3_ENDPOINT }}
+          SYMBOLS_S3_BUCKET: ${{ secrets.SYMBOLS_S3_BUCKET }}
+          AWS_DEFAULT_REGION: ${{ secrets.SYMBOLS_S3_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.SYMBOLS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SYMBOLS_SECRET_ACCESS_KEY }}
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          AWS_EC2_METADATA_DISABLED: "true"
+        run: |
+          set -euo pipefail
+          sym_dir="build/symbols/$PLATFORM"
+          archive="../symbols-${PLATFORM}-${VERSION}.tgz"
+          trap 'rm -rf "$sym_dir" "$archive"' EXIT
+          compgen -G "$sym_dir/*.symbols" >/dev/null || { echo "::error::No .symbols files in $sym_dir"; exit 1; }
+          if [[ -f build/app/outputs/mapping/release/mapping.txt ]]; then
+            cp build/app/outputs/mapping/release/mapping.txt "$sym_dir/mapping.txt"
+          else
+            echo "::warning::Android R8 mapping.txt not found"
+          fi
+          ls -lh "$sym_dir"
+          tar czf "$archive" -C "$sym_dir" .
+          if [[ "$CREATE_RELEASE" == "true" ]]; then
+            key="symbols/v${VERSION}/symbols-${PLATFORM}-${VERSION}.tgz"
+          else
+            key="symbols/dry-run/${RUN_ID}/symbols-${PLATFORM}-${VERSION}.tgz"
+          fi
+          endpoint="${SYMBOLS_S3_ENDPOINT%/}"
+          [[ "$endpoint" == http*://* ]] || endpoint="https://$endpoint"
+          aws s3api put-object --endpoint-url "$endpoint" --bucket "$SYMBOLS_S3_BUCKET" --key "$key" --body "$archive" --content-type "application/gzip" >/dev/null
+          echo "Uploaded $key ($(wc -c < "$archive" | tr -d ' ') bytes)"
 
       - name: Rename artifacts
         run: |
@@ -323,7 +442,39 @@ jobs:
         shell: bash
         run: sed -i.bak 's#https://pub.flutter-io.cn#https://pub.dev#g' pubspec.lock && rm pubspec.lock.bak
       - run: flutter pub get --enforce-lockfile
-      - run: flutter build ios --release --no-codesign --build-name=${{ needs.resolve.outputs.version }}
+      - run: flutter build ios --release --no-codesign --build-name=${{ needs.resolve.outputs.version }} --obfuscate --split-debug-info=build/symbols/ios
+      - name: Upload iOS symbols
+        shell: bash
+        env:
+          PLATFORM: ios
+          VERSION: ${{ needs.resolve.outputs.version }}
+          CREATE_RELEASE: ${{ needs.resolve.outputs.create_release }}
+          RUN_ID: ${{ github.run_id }}
+          SYMBOLS_S3_ENDPOINT: ${{ secrets.SYMBOLS_S3_ENDPOINT }}
+          SYMBOLS_S3_BUCKET: ${{ secrets.SYMBOLS_S3_BUCKET }}
+          AWS_DEFAULT_REGION: ${{ secrets.SYMBOLS_S3_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.SYMBOLS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SYMBOLS_SECRET_ACCESS_KEY }}
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          AWS_EC2_METADATA_DISABLED: "true"
+        run: |
+          set -euo pipefail
+          sym_dir="build/symbols/$PLATFORM"
+          archive="../symbols-${PLATFORM}-${VERSION}.tgz"
+          trap 'rm -rf "$sym_dir" "$archive"' EXIT
+          compgen -G "$sym_dir/*.symbols" >/dev/null || { echo "::error::No .symbols files in $sym_dir"; exit 1; }
+          ls -lh "$sym_dir"
+          tar czf "$archive" -C "$sym_dir" .
+          if [[ "$CREATE_RELEASE" == "true" ]]; then
+            key="symbols/v${VERSION}/symbols-${PLATFORM}-${VERSION}.tgz"
+          else
+            key="symbols/dry-run/${RUN_ID}/symbols-${PLATFORM}-${VERSION}.tgz"
+          fi
+          endpoint="${SYMBOLS_S3_ENDPOINT%/}"
+          [[ "$endpoint" == http*://* ]] || endpoint="https://$endpoint"
+          aws s3api put-object --endpoint-url "$endpoint" --bucket "$SYMBOLS_S3_BUCKET" --key "$key" --body "$archive" --content-type "application/gzip" >/dev/null
+          echo "Uploaded $key ($(wc -c < "$archive" | tr -d ' ') bytes)"
       - name: Create IPA
         run: |
           mkdir -p Payload
