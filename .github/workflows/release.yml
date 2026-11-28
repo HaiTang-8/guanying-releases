@@ -102,7 +102,7 @@ jobs:
         shell: bash
         run: sed -i.bak 's#https://pub.flutter-io.cn#https://pub.dev#g' pubspec.lock && rm pubspec.lock.bak
       - run: flutter pub get --enforce-lockfile
-      - run: flutter build windows --release --build-name=${{ needs.resolve.outputs.version }}
+      - run: flutter build windows --release --build-name=${{ needs.resolve.outputs.version }} --dart-define=LICENSE_PUBLIC_KEY=${{ vars.LICENSE_PUBLIC_KEY }}
       - name: Install Inno Setup
         run: choco install innosetup -y
       - name: Download Chinese language file for Inno Setup
@@ -152,7 +152,7 @@ jobs:
         shell: bash
         run: sed -i.bak 's#https://pub.flutter-io.cn#https://pub.dev#g' pubspec.lock && rm pubspec.lock.bak
       - run: flutter pub get --enforce-lockfile
-      - run: flutter build macos --release --build-name=${{ needs.resolve.outputs.version }}
+      - run: flutter build macos --release --build-name=${{ needs.resolve.outputs.version }} --dart-define=LICENSE_PUBLIC_KEY=${{ vars.LICENSE_PUBLIC_KEY }}
       - name: Create DMG
         run: |
           brew install create-dmg
@@ -262,7 +262,7 @@ jobs:
           printf 'storeFile=release.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
             "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEYSTORE_PASSWORD" > android/key.properties
 
-      - run: flutter build apk --release --split-per-abi --target-platform android-arm,android-arm64 --build-name=${{ needs.resolve.outputs.version }}
+      - run: flutter build apk --release --split-per-abi --target-platform android-arm,android-arm64 --build-name=${{ needs.resolve.outputs.version }} --dart-define=LICENSE_PUBLIC_KEY=${{ vars.LICENSE_PUBLIC_KEY }}
 
       - name: Rename artifacts
         run: |
@@ -323,7 +323,7 @@ jobs:
         shell: bash
         run: sed -i.bak 's#https://pub.flutter-io.cn#https://pub.dev#g' pubspec.lock && rm pubspec.lock.bak
       - run: flutter pub get --enforce-lockfile
-      - run: flutter build ios --release --no-codesign --build-name=${{ needs.resolve.outputs.version }}
+      - run: flutter build ios --release --no-codesign --build-name=${{ needs.resolve.outputs.version }} --dart-define=LICENSE_PUBLIC_KEY=${{ vars.LICENSE_PUBLIC_KEY }}
       - name: Create IPA
         run: |
           mkdir -p Payload
